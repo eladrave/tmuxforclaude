@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# tfc - tmux for Claude: run Claude Code Remote Control servers, one per project, in tmux windows.
+# https://github.com/eladrave/tmuxforclaude
+set -euo pipefail
+
+TFC_VERSION=0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+
+SESSION=${TFC_SESSION:-claude}
+CONF_DIR=${TFC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tmuxforclaude}
+REG=$CONF_DIR/projects.tsv # name <TAB> dir <TAB> permission mode <TAB> spawn mode
+ROOT=${TFC_ROOT:-$HOME/git}
+DEFAULT_MODE=${TFC_MODE:-bypassPermissions}
+CLAUDE=${TFC_CLAUDE:-claude}
+WAIT=${TFC_WAIT:-45}       # seconds to wait for a server to come up
+AUTO_TRUST=${TFC_AUTO_TRUST:-1}
+
+MODES="acceptEdits auto bypassPermissions default dontAsk plan"
+SPAWNS="same-dir worktree session"
+
+die() { echo "tfc: $*" >&2; exit 1; }
+say() { echo "tfc: $*"; }
+T() { tmux ${TFC_SOCKET:+-L "$TFC_SOCKET"} "$@"; }
+
+usage() {
+	cat <<EOF
+tfc $TFC_VERSION - Claude Code Remote Control projects in tmux (session "$SESSION")
+
+  tfc new <name> [dir] [--mode M] [--spawn S] [--no-start]
+                         register a project and start its server (dir defaults to $ROOT/<name>)
+  tfc list               every registered project and whether its server runs
+  tfc start <name>       start a registered project's server (no-op if it runs)
+  tfc start-all          start every registered project that is not running (used at boot)
+  tfc restart <name>     stop, then start
+  tfc stop <name>        stop a project's server and close its window (stays registered)
+  tfc rm <name>          stop and unregister (never deletes the folder)
+  tfc logs <name> [N]    the last N lines (default 40) of the project's window
+  tfc attach [name]      attach to the tmux session (at that project's window)
+  tfc doctor             check tmux, claude, the login and the boot service
+  tfc version
+
+Modes (--mode): $MODES (default $DEFAULT_MODE)
+Spawn (--spawn): $SPAWNS (default: claude's own, same-dir; worktree needs a git repository)
+Registry: $REG
+EOF
+}
+
+abspath() { # a folder's absolute path with symlinks resolved; it need not exist yet
+	realpath -m -- "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+valid_name() { [[ $1 =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "invalid name '$1' (letters, digits, _ and -, at most 40)"; }
+in_list() { local x; for x in $2; do [[ $x == "$1" ]] && return 0; done; return 1; }
+
+reg_get() { # name -> prints "dir<TAB>mode<TAB>spawn", status 1 if absent
+	[[ -f $REG ]] || return 1
+	awk -F'\t' -v n="$1" '$1==n {print $2"\t"$3"\t"$4; f=1} END {exit !f}' "$REG"
+}
+reg_names() { [[ -f $REG ]] && awk -F'\t' 'NF {print $1}' "$REG" || true; }
+# Registry writes hold a lock only inside a subshell, so the descriptor never reaches tmux or claude.
+reg_put() { # name dir mode spawn
+	mkdir -p "$CONF_DIR"
+	(
+		if command -v flock >/dev/null; then flock -w 10 9 || die "the registry is locked by another tfc; try again"; fi
+		tmp=$(mktemp "$CONF_DIR/.projects.XXXXXX")
+		{ [[ -f $REG ]] && awk -F'\t' -v n="$1" '$1!=n' "$REG"; printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; } >"$tmp"
+		mv "$tmp" "$REG"
+	) 9>"$CONF_DIR/.lock"
+}
+reg_del() {
+	[[ -f $REG ]] || return 0
+	(
+		if command -v flock >/dev/null; then flock -w 10 9 || die "the registry is locked by another tfc; try again"; fi
+		tmp=$(mktemp "$CONF_DIR/.projects.XXXXXX")
+		awk -F'\t' -v n="$1" '$1!=n' "$REG" >"$tmp"
+		mv "$tmp" "$REG"
+	) 9>"$CONF_DIR/.lock"
+}
+
+has_session() { T has-session -t "=$SESSION" 2>/dev/null; }
+win_id() { # name -> tmux window id (@N) or nothing
+	has_session || return 0
+	T list-windows -t "=$SESSION" -F '#{window_id}	#{window_name}	#{@tfc}' |
+		awk -F'\t' -v n="$1" '$2==n && $3=="1" {print $1; exit}'
+}
+running() { # name -> 0 if a claude remote-control process runs in its window
+	local id pid
+	id=$(win_id "$1")
+	[[ -n $id ]] || return 1
+	pid=$(T display-message -p -t "$id" '#{pane_pid}')
+	pgrep -P "$pid" -f 'remote-control' >/dev/null 2>&1
+}
+
+# The window runs claude through this wrapper, which keeps the window (and its output, for tfc logs) open after
+# claude exits. Arguments pass as argv: no shell quoting is involved.
+WRAP='"$@"; rc=$?; echo; echo "[tfc] claude exited ($rc). tfc start $0 starts it again."; exec sleep 2147483647'
+
+bypass_consent() { # 0 if this user has accepted bypass mode's warning once (Claude Code records it)
+	grep -qs '"skipDangerousModePermissionPrompt": *true' "$HOME/.claude/settings.json" ||
+		grep -qs '"bypassPermissionsModeAccepted": *true' "$HOME/.claude.json"
+}
+BYPASS_HOWTO="bypass mode needs your one-time consent, or Remote Control sessions fall back to default mode: run  claude --dangerously-skip-permissions  once in a terminal and accept its warning (Claude Code then records skipDangerousModePermissionPrompt in ~/.claude/settings.json)"
+
+screen() { T capture-pane -p -t "$1" 2>/dev/null; } # the visible screen only (not the scrollback)
+
+wait_up() { # name window-id: answer the first-run questions, wait until the server is ready
+	local id=$2 pane i quiet=0 trusted=0 enabled=0
+	for ((i = 0; i < WAIT; i++)); do
+		sleep 1
+		pane=$(screen "$id") || { say "$1: the window closed"; return 1; }
+		if grep -q '\[tfc\] claude exited' <<<"$pane"; then
+			say "$1: claude exited. Last lines:"; T capture-pane -p -t "$id" -S -200 | awk 'NF' | tail -n 15
+			return 1
+		fi
+		# "Enable Remote Control? (y/n)" is a line question.
+		if grep -q 'Enable Remote Control?' <<<"$pane" && ! grep -q 'Enable Remote Control? *(y/n) *y' <<<"$pane"; then
+			if ((enabled)); then # answered once and still waiting: never type again (an Enter could hit the trust menu)
+				say "$1: the Enable Remote Control question is still open; answer it: tfc attach $1"; return 1
+			fi
+			T send-keys -t "$id" y Enter; sleep 2; enabled=1; quiet=0; continue
+		fi
+		# The folder-trust question is a menu ("No, exit" is selected first): move down to "Yes", then Enter.
+		if grep -Eq 'Yes, I trust this folder|Accessing workspace' <<<"$pane"; then
+			if [[ $AUTO_TRUST != 1 ]]; then
+				say "$1: waiting for you to answer the folder-trust question: tfc attach $1"; return 1
+			fi
+			if ((trusted)); then # answered once and still shown: never press again (the menu may wrap to "No, exit")
+				say "$1: the folder-trust question is still open; answer it: tfc attach $1"; return 1
+			fi
+			sleep 1 # the menu ignores keys for its first half second
+			T send-keys -t "$id" Down; sleep 0.5; T send-keys -t "$id" Enter; sleep 2; trusted=1; quiet=0; continue
+		fi
+		# An older line form of the same question.
+		if grep -Eq 'Trust .*\? *\[y/N\] *$' <<<"$pane"; then
+			[[ $AUTO_TRUST == 1 ]] || { say "$1: waiting for you to answer the folder-trust question: tfc attach $1"; return 1; }
+			T send-keys -t "$id" y Enter; quiet=0; continue
+		fi
+		running "$1" || continue
+		# The enable question's own text mentions claude.ai/code: look only below it.
+		if awk '/Enable Remote Control\? *\(y\/n\)/ {p = NR} {l[NR] = $0} END {for (i = p + 1; i <= NR; i++) print l[i]}' <<<"$pane" |
+			grep -Eq 'claude\.ai/code|Open the Code tab'; then
+			say "$1: up. Open the Claude app > Code > \"$1\""
+			return 0
+		fi
+		# Running with no question on screen for a while: most likely up, in a screen tfc does not recognise.
+		if ((++quiet >= 12)); then
+			say "$1: running (no ready message recognised; check with  tfc logs $1)"
+			return 0
+		fi
+	done
+	say "$1: not up after ${WAIT}s (still starting, or waiting for input). Last lines:"
+	T capture-pane -p -t "$id" | awk 'NF' | tail -n 15
+	return 1
+}
+
+start_one() { # name
+	local name=$1 entry dir mode spawn id
+	entry=$(reg_get "$name") || die "no project '$name' (tfc list)"
+	IFS=$'\t' read -r dir mode spawn <<<"$entry"
+	if running "$name"; then say "$name: already running"; return 0; fi
+	command -v "$CLAUDE" >/dev/null || die "'$CLAUDE' not found (install Claude Code: curl -fsSL https://claude.ai/install.sh | bash)"
+	if ! "$CLAUDE" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+		die "Claude Code is not signed in; Remote Control needs a claude.ai login: run  claude auth login"
+	fi
+	[[ $mode != bypassPermissions ]] || bypass_consent || say "$name: WARNING: $BYPASS_HOWTO"
+	mkdir -p "$dir"
+	id=$(win_id "$name")
+	[[ -z $id ]] || T kill-window -t "$id" # a window whose claude has exited: start fresh
+	local args=("$CLAUDE" remote-control --name "$name" --permission-mode "$mode")
+	[[ -z $spawn ]] || args+=(--spawn "$spawn")
+	if has_session; then
+		id=$(T new-window -d -P -F '#{window_id}' -t "=$SESSION:" -n "$name" -c "$dir" \
+			bash -c "$WRAP" "$name" "${args[@]}")
+	else
+		id=$(T new-session -d -P -F '#{window_id}' -s "$SESSION" -n "$name" -c "$dir" \
+			bash -c "$WRAP" "$name" "${args[@]}")
+	fi
+	T set-option -w -t "$id" @tfc 1
+	T set-option -w -t "$id" automatic-rename off
+	wait_up "$name" "$id"
+}
+
+stop_one() { # name
+	local id
+	id=$(win_id "$1")
+	[[ -n $id ]] || { say "$1: not running"; return 0; }
+	if [[ -n ${TMUX_PANE:-} && ${TFC_FORCE:-0} != 1 ]] &&
+		[[ $(T display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null) == "$id" ]]; then
+		die "$1 is the project this command runs in; stopping it would stop this session too (TFC_FORCE=1 to do it anyway)"
+	fi
+	if running "$1"; then
+		T send-keys -t "$id" C-c; sleep 2
+		running "$1" && { T send-keys -t "$id" C-c; sleep 2; }
+	fi
+	T kill-window -t "$id"
+	say "$1: stopped"
+}
+
+cmd_new() {
+	local name="" dir="" mode=$DEFAULT_MODE spawn="" start=1 old
+	while (($#)); do
+		case $1 in
+		--mode) mode=${2:?--mode needs a value}; shift 2 ;;
+		--spawn) spawn=${2:?--spawn needs a value}; shift 2 ;;
+		--no-start) start=0; shift ;;
+		-h | --help) usage; return 0 ;;
+		-*) die "unknown option $1" ;;
+		*) if [[ -z $name ]]; then name=$1; elif [[ -z $dir ]]; then dir=$1; else die "too many arguments"; fi; shift ;;
+		esac
+	done
+	[[ -n $name ]] || die "usage: tfc new <name> [dir] [--mode M] [--spawn S]"
+	valid_name "$name"
+	in_list "$mode" "$MODES" || die "unknown mode '$mode' (one of: $MODES)"
+	[[ -z $spawn ]] || in_list "$spawn" "$SPAWNS" || die "unknown spawn '$spawn' (one of: $SPAWNS)"
+	dir=${dir:-$ROOT/$name}
+	[[ $dir != *$'\t'* && $dir != *$'\n'* ]] || die "the folder name may not contain a tab or newline"
+	dir=$(abspath "$dir")
+	if old=$(reg_get "$name"); then
+		[[ ${old%%$'\t'*} == "$dir" ]] || die "'$name' is already registered for ${old%%$'\t'*}"
+	fi
+	mkdir -p "$dir"
+	reg_put "$name" "$dir" "$mode" "$spawn"
+	say "$name: registered ($dir, mode $mode${spawn:+, spawn $spawn})"
+	if ((start)); then start_one "$name"; fi
+}
+
+cmd_list() {
+	local name entry dir mode spawn state n=0
+	printf '%-20s %-8s %-18s %s\n' NAME STATE MODE DIR
+	while IFS= read -r name; do
+		[[ -n $name ]] || continue
+		entry=$(reg_get "$name") || continue
+		IFS=$'\t' read -r dir mode spawn <<<"$entry"
+		if running "$name"; then state=running; else state=stopped; fi
+		printf '%-20s %-8s %-18s %s\n' "$name" "$state" "$mode${spawn:+/$spawn}" "$dir"
+		n=$((n + 1))
+	done < <(reg_names)
+	((n)) || echo "(no projects yet: tfc new <name>)"
+}
+
+cmd_start_all() {
+	local name rc=0
+	while IFS= read -r name; do
+		[[ -n $name ]] || continue
+		start_one "$name" || rc=1
+	done < <(reg_names)
+	return $rc
+}
+
+cmd_attach() {
+	has_session || die "no tmux session '$SESSION' yet (tfc new <name>)"
+	local target="=$SESSION"
+	if [[ -n ${1:-} ]]; then
+		local id; id=$(win_id "$1"); [[ -n $id ]] || die "no window for '$1'"
+		target=$id
+	fi
+	if [[ -n ${TMUX:-} ]]; then T switch-client -t "$target"; else T attach-session -t "$target"; fi
+}
+
+cmd_doctor() {
+	local ok=1
+	if command -v tmux >/dev/null; then say "ok   tmux $(tmux -V | cut -d' ' -f2)"; else say "FAIL tmux not installed"; ok=0; fi
+	if command -v "$CLAUDE" >/dev/null; then
+		say "ok   claude $("$CLAUDE" --version 2>/dev/null | head -n1)"
+		if "$CLAUDE" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then say "ok   claude is signed in"
+		else say "FAIL claude is not signed in: run  claude auth login"; ok=0; fi
+		if bypass_consent; then say "ok   bypass-mode consent recorded"; else say "WARN $BYPASS_HOWTO"; fi
+	else say "FAIL claude not found (curl -fsSL https://claude.ai/install.sh | bash)"; ok=0; fi
+	if command -v systemctl >/dev/null && systemctl --user is-enabled tmuxforclaude.service >/dev/null 2>&1; then
+		say "ok   boot service tmuxforclaude.service enabled"
+		if [[ $(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null) == yes ]]; then say "ok   linger on (starts at boot without a login)"
+		else say "WARN linger off: the servers start only after you log in (sudo loginctl enable-linger $(id -un))"; fi
+	else say "WARN boot service not installed: after a reboot run  tfc start-all"; fi
+	say "     registry $REG ($(reg_names | wc -l) projects)"
+	((ok))
+}
+
+main() {
+	local cmd=${1:-help}
+	shift || true
+	case $cmd in
+	new) cmd_new "$@" ;;
+	list | ls) cmd_list ;;
+	start) [[ -n ${1:-} ]] || die "usage: tfc start <name>"; start_one "$1" ;;
+	start-all) cmd_start_all ;;
+	restart) [[ -n ${1:-} ]] || die "usage: tfc restart <name>"; reg_get "$1" >/dev/null || die "no project '$1'"; stop_one "$1"; start_one "$1" ;;
+	stop) [[ -n ${1:-} ]] || die "usage: tfc stop <name>"; reg_get "$1" >/dev/null || [[ -n $(win_id "$1") ]] || die "no project '$1'"; stop_one "$1" ;;
+	rm) [[ -n ${1:-} ]] || die "usage: tfc rm <name>"; reg_get "$1" >/dev/null || die "no project '$1'"; stop_one "$1"; reg_del "$1"; say "$1: unregistered (folder kept)" ;;
+	logs) [[ -n ${1:-} ]] || die "usage: tfc logs <name> [N]"; local id; id=$(win_id "$1"); [[ -n $id ]] || die "'$1' has no window"; T capture-pane -p -t "$id" -S -2000 | awk 'NF' | tail -n "${2:-40}" ;;
+	attach) cmd_attach "${1:-}" ;;
+	doctor) cmd_doctor ;;
+	version | --version) echo "tfc $TFC_VERSION" ;;
+	help | -h | --help) usage ;;
+	*) usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

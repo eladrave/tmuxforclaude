@@ -1,0 +1,17 @@
+[Unit]
+Description=tmuxforclaude: start the registered Claude Code Remote Control projects in tmux
+Documentation=https://github.com/eladrave/tmuxforclaude
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Give the network a moment after boot; a project that fails to start does not fail the others.
+ExecStartPre=/bin/sleep 10
+ExecStart=-%h/.local/bin/tfc start-all
+TimeoutStartSec=900
+# Stopping or restarting this unit must not kill tmux and the servers it started.
+KillMode=process
+# The unit does not read your shell settings; put TFC_* variables in ~/.config/environment.d/tfc.conf.
+
+[Install]
+WantedBy=default.target
