@@ -15,7 +15,8 @@ main() {
 	BIN="$HOME/.local/bin"
 	SKILL_DIR="$HOME/.claude/skills/tmuxforclaude"
 	UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-	export PATH="$BIN:$PATH"
+	ORIG_PATH=$PATH
+export PATH="$BIN:$PATH"
 
 	say() { echo "tmuxforclaude: $*"; }
 	die() { echo "tmuxforclaude: $*" >&2; exit 1; }
@@ -101,6 +102,8 @@ main() {
 	fi
 	if ! grep -qs '.local/bin' "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" 2>/dev/null; then
 		say "add ~/.local/bin to your PATH:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+	elif [[ ":$ORIG_PATH:" != *":$BIN:"* ]]; then
+		say "open a new login shell first (or run  export PATH=\"\$HOME/.local/bin:\$PATH\"), so claude and tfc are found"
 	fi
 }
 
